@@ -122,20 +122,49 @@ const TOOLS = [
 
 // ---------------------------------------------------------------------------
 // SIMPRO API CLIENT
-// Retool's "Simpro Wellington API" resource is configured with a plain
-// Bearer Token (not OAuth2 client-credentials) — so this just attaches
-// that static token to every request. Endpoint paths below still need
-// confirming against the real API (see comments per tool).
+// Confirmed real endpoint, taken directly from Retool's working getJobsReal
+// query: companies/{COMPANY_ID}/jobs/, paginated. Company ID and the
+// status → stage mapping below are copied from that same source so this
+// agent's numbers agree with what the Hub already shows.
 // ---------------------------------------------------------------------------
+const COMPANY_ID = 5;
+
+// Status ID → stage mapping for Wellington (matches Retool's getJobsReal)
+const STATUS_STAGE_MAP = {
+  692: 'needs-attention',   // 5-Needs Organizing
+  691: 'needs-attention',   // 4-Variation Pending Deposit
+  688: 'active',            // 3-VIP Job Section
+  1431: 'active',           // 6-Scheduled
+  804: 'active',            // 7-Remedial Works Commenced
+  1332: 'active',           // 8-Remedial Completed - Pending install
+  690: 'active',            // 9-Coating Works in Progress
+  1202: 'active',           // 12-Snags List In Progress
+  673: 'awaiting-payment',  // 1-Sales Invoice Issued
+  771: 'awaiting-payment',  // 10-Practical Completion – Final Invoice Sent
+  1464: 'awaiting-payment', // 11-Post QA Complete - Waiting Final Payment
+  1365: 'awaiting-payment', // 13-Snag List Complete-Waiting Full Payment
+  652: 'complete',          // 16-Fully Paid – Archived
+  681: 'excluded',          // 15-Warranty Works
+  654: 'excluded',          // 17-On Hold
+  653: 'excluded'           // 18-Cancelled / Duplicate / Archive
+};
+
 async function simproRequest(path, params = {}) {
   if (!process.env.SIMPRO_BEARER_TOKEN) {
     throw new Error('SIMPRO_BEARER_TOKEN not configured');
   }
-  const url = new URL(`${process.env.SIMPRO_BASE_URL}${path}`);
+  const base = process.env.SIMPRO_BASE_URL.endsWith('/')
+    ? process.env.SIMPRO_BASE_URL
+    : process.env.SIMPRO_BASE_URL + '/';
+  const cleanPath = path.replace(/^\/+/, '');
+  const url = new URL(cleanPath, base);
   Object.entries(params).forEach(([k, v]) => v != null && url.searchParams.set(k, v));
 
   const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${process.env.SIMPRO_BEARER_TOKEN}` }
+    headers: {
+      Authorization: `Bearer ${process.env.SIMPRO_BEARER_TOKEN}`,
+      Accept: 'application/json'
+    }
   });
   if (!res.ok) {
     throw new Error(`Simpro API error ${res.status}: ${await res.text()}`);
@@ -143,28 +172,95 @@ async function simproRequest(path, params = {}) {
   return res.json();
 }
 
+// Fetches every job for this company, paginated, same shape as Retool's
+// fetchAllJobs. Other tools (invoices, PnL, purchase orders) still need
+// their own confirmed endpoints — this only covers job status/scheduling.
+async function fetchAllJobs() {
+  const all = [];
+  let page = 1;
+  while (true) {
+    const res = await simproRequest(`companies/${COMPANY_ID}/jobs/`, {
+      pageSize: '100',
+      page: String(page),
+      columns: 'ID,Status,Type,Total,DateIssued,DueDate,Site,Customer,Name'
+    });
+    const batch = res.data;
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    all.push(...batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+  return all;
+}
+
+function shapeJob(j) {
+  const statusId = j.Status?.ID ?? 0;
+  const stage = STATUS_STAGE_MAP[statusId] ?? 'active';
+  const customer = j.Customer?.CompanyName
+    || `${j.Customer?.GivenName ?? ''} ${j.Customer?.FamilyName ?? ''}`.trim()
+    || 'Unknown';
+  return {
+    id: j.ID,
+    name: j.Name ?? `Job #${j.ID}`,
+    statusName: (j.Status?.Name ?? 'Unknown').trim(),
+    stage,
+    customer,
+    siteAddress: j.Site?.Name ?? '',
+    totalIncTax: j.Total?.IncTax ?? 0,
+    dateIssued: j.DateIssued ?? '',
+    dueDate: j.DueDate ?? ''
+  };
+}
+
 const toolImplementations = {
   async getJobStatus({ jobNumber, filter }) {
-    // TODO: confirm the real Simpro endpoint/path — likely something under
-    // /jobs with status fields. Check the Retool resource's existing queries
-    // for the exact path Assist was already using.
-    return simproRequest('/jobs', { jobNumber, filter });
+    const jobs = (await fetchAllJobs())
+      .filter((j) => STATUS_STAGE_MAP[j.Status?.ID] !== 'excluded')
+      .map(shapeJob);
+
+    if (jobNumber) {
+      const match = jobs.find((j) => String(j.id) === String(jobNumber));
+      return match ? { job: match } : { error: `No job found with number ${jobNumber}` };
+    }
+
+    if (filter) {
+      const needle = filter.toLowerCase();
+      const matches = jobs.filter(
+        (j) => j.name.toLowerCase().includes(needle) || j.stage.includes(needle) || j.customer.toLowerCase().includes(needle)
+      );
+      return { count: matches.length, jobs: matches.slice(0, 25) };
+    }
+
+    return { count: jobs.length, jobs: jobs.slice(0, 25) };
   },
 
-  async getSchedulingGaps({ withinDays }) {
-    return simproRequest('/jobs/scheduling-gaps', { withinDays });
+  async getSchedulingGaps() {
+    const jobs = (await fetchAllJobs())
+      .filter((j) => STATUS_STAGE_MAP[j.Status?.ID] === 'needs-attention')
+      .map(shapeJob);
+
+    return {
+      count: jobs.length,
+      totalValue: jobs.reduce((s, j) => s + j.totalIncTax, 0),
+      jobs
+    };
   },
 
   async getInvoiceStatus({ jobNumber, dateFrom, dateTo }) {
-    return simproRequest('/invoices', { jobNumber, dateFrom, dateTo });
+    // TODO: not yet wired to a confirmed Simpro endpoint — check Retool's
+    // getInvoices query for the real path, same way we found getJobsReal's.
+    throw new Error('getInvoiceStatus not yet implemented — endpoint not confirmed');
   },
 
   async getJobPnl({ jobNumber }) {
-    return simproRequest(`/jobs/${jobNumber}/pnl`);
+    // TODO: not yet wired to a confirmed Simpro endpoint.
+    throw new Error('getJobPnl not yet implemented — endpoint not confirmed');
   },
 
   async getJobPurchaseOrders({ jobNumber, dateFrom, dateTo }) {
-    return simproRequest(`/jobs/${jobNumber}/purchase-orders`, { dateFrom, dateTo });
+    // TODO: not yet wired to a confirmed Simpro endpoint — check Retool's
+    // getPurchaseOrders query for the real path.
+    throw new Error('getJobPurchaseOrders not yet implemented — endpoint not confirmed');
   }
 };
 
