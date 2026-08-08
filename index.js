@@ -184,7 +184,9 @@ async function fetchAllJobs() {
       page: String(page),
       columns: 'ID,Status,Type,Total,DateIssued,DueDate,Site,Customer,Name'
     });
-    const batch = res.data;
+    // Simpro's jobs endpoint returns a bare array, not {data: [...]} — handle
+    // both shapes defensively in case that ever changes.
+    const batch = Array.isArray(res) ? res : res.data;
     if (!Array.isArray(batch) || batch.length === 0) break;
     all.push(...batch);
     if (batch.length < 100) break;
