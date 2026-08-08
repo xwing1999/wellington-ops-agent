@@ -6,6 +6,20 @@ const app = express();
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
+// CORS — allows a browser page (like the test tool) to call this service.
+// Must run before the auth check, and must let OPTIONS preflight requests
+// through without requiring the API key (browsers send these automatically
+// and don't attach custom headers to them).
+// ---------------------------------------------------------------------------
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+// ---------------------------------------------------------------------------
 // AUTH — require a shared secret so this deployed URL can't be hit (and
 // billed) by anyone who finds it. Retool will send this as a header when
 // it calls this service. Set API_KEY in .env and keep it out of git.
@@ -107,25 +121,21 @@ const TOOLS = [
 ];
 
 // ---------------------------------------------------------------------------
-// SIMPRO API CLIENT — STUBBED.
-// Fill in getSimproToken() and the four endpoint paths below using the real
-// Simpro Wellington API details (see .env.example). These stubs currently
-// throw so it's obvious in testing what still needs wiring up.
+// SIMPRO API CLIENT
+// Retool's "Simpro Wellington API" resource is configured with a plain
+// Bearer Token (not OAuth2 client-credentials) — so this just attaches
+// that static token to every request. Endpoint paths below still need
+// confirming against the real API (see comments per tool).
 // ---------------------------------------------------------------------------
-async function getSimproToken() {
-  // TODO: implement OAuth2 client-credentials flow against Simpro, cache
-  // the token until it expires. See Simpro's API auth docs for this
-  // Kiwiseal Wellington instance.
-  throw new Error('Simpro auth not yet configured — see getSimproToken() in index.js');
-}
-
 async function simproRequest(path, params = {}) {
-  const token = await getSimproToken();
+  if (!process.env.SIMPRO_BEARER_TOKEN) {
+    throw new Error('SIMPRO_BEARER_TOKEN not configured');
+  }
   const url = new URL(`${process.env.SIMPRO_BASE_URL}${path}`);
   Object.entries(params).forEach(([k, v]) => v != null && url.searchParams.set(k, v));
 
   const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` }
+    headers: { Authorization: `Bearer ${process.env.SIMPRO_BEARER_TOKEN}` }
   });
   if (!res.ok) {
     throw new Error(`Simpro API error ${res.status}: ${await res.text()}`);
