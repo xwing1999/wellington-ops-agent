@@ -83,13 +83,13 @@ const TOOLS = [
   },
   {
     name: 'getInvoiceStatus',
-    description: 'Returns invoiced vs outstanding amounts for a given job or date range in Wellington.',
+    description: 'Returns invoiced vs outstanding amounts and per-invoice detail for a given job or date range in Wellington.',
     input_schema: {
       type: 'object',
       properties: {
         jobNumber: { type: 'string' },
-        dateFrom: { type: 'string', description: 'ISO date' },
-        dateTo: { type: 'string', description: 'ISO date' }
+        dateFrom: { type: 'string', description: 'ISO date, filters by DateIssued' },
+        dateTo: { type: 'string', description: 'ISO date, filters by DateIssued' }
       }
     }
   },
@@ -195,6 +195,59 @@ async function fetchAllJobs() {
   return all;
 }
 
+// ---------------------------------------------------------------------------
+// Confirmed real endpoints for invoices / purchase orders (called
+// "vendorOrders" in Simpro's own API) / job P&L. Found the same way the
+// jobs endpoint was found originally: matched Retool's own native code
+// against the live API, verified with real Wellington data before porting.
+// Two path quirks that don't follow the jobs-collection pattern:
+//   - Single job detail (`jobs/{id}`) takes NO trailing slash — the
+//     opposite of the collection endpoints below, which all need one.
+//   - Purchase orders are "vendorOrders" in Simpro, not "purchaseOrders".
+// ---------------------------------------------------------------------------
+async function fetchAllInvoices() {
+  const all = [];
+  let page = 1;
+  while (true) {
+    const res = await simproRequest(`companies/${COMPANY_ID}/invoices/`, {
+      pageSize: '100',
+      page: String(page),
+      columns: 'ID,Type,Customer,Jobs,Total,IsPaid,DateIssued,Status'
+    });
+    const batch = Array.isArray(res) ? res : res.data;
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    all.push(...batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+  return all;
+}
+
+async function fetchAllVendorOrders() {
+  const all = [];
+  let page = 1;
+  while (true) {
+    const res = await simproRequest(`companies/${COMPANY_ID}/vendorOrders/`, {
+      pageSize: '100',
+      page: String(page),
+      columns: 'ID,Stage,Reference,Totals,AssignedTo,DateIssued'
+    });
+    const batch = Array.isArray(res) ? res : res.data;
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    all.push(...batch);
+    if (batch.length < 100) break;
+    page++;
+  }
+  return all;
+}
+
+function pnlHealth(marginPct) {
+  if (marginPct >= 60) return 'strong';
+  if (marginPct >= 40) return 'ok';
+  if (marginPct >= 0) return 'tight';
+  return 'loss';
+}
+
 function shapeJob(j) {
   const statusId = j.Status?.ID ?? 0;
   const stage = STATUS_STAGE_MAP[statusId] ?? 'active';
@@ -249,20 +302,110 @@ const toolImplementations = {
   },
 
   async getInvoiceStatus({ jobNumber, dateFrom, dateTo }) {
-    // TODO: not yet wired to a confirmed Simpro endpoint — check Retool's
-    // getInvoices query for the real path, same way we found getJobsReal's.
-    throw new Error('getInvoiceStatus not yet implemented — endpoint not confirmed');
+    let invoices = await fetchAllInvoices();
+
+    if (jobNumber) {
+      invoices = invoices.filter((inv) => (inv.Jobs || []).some((j) => String(j.ID) === String(jobNumber)));
+    }
+    if (dateFrom) invoices = invoices.filter((inv) => (inv.DateIssued ?? '') >= dateFrom);
+    if (dateTo) invoices = invoices.filter((inv) => (inv.DateIssued ?? '') <= dateTo);
+
+    const shaped = invoices.map((inv) => ({
+      invoiceId: inv.ID,
+      type: inv.Type,
+      customer: inv.Customer?.CompanyName
+        || `${inv.Customer?.GivenName ?? ''} ${inv.Customer?.FamilyName ?? ''}`.trim()
+        || 'Unknown',
+      jobIds: (inv.Jobs || []).map((j) => j.ID),
+      statusName: inv.Status?.Name ?? 'Unknown',
+      dateIssued: inv.DateIssued ?? '',
+      totalIncTax: inv.Total?.IncTax ?? 0,
+      balanceDue: inv.Total?.BalanceDue ?? 0,
+      isPaid: inv.IsPaid ?? false
+    }));
+
+    return {
+      count: shaped.length,
+      totalInvoiced: shaped.reduce((s, i) => s + i.totalIncTax, 0),
+      totalOutstanding: shaped.reduce((s, i) => s + i.balanceDue, 0),
+      totalPaid: shaped.filter((i) => i.isPaid).reduce((s, i) => s + i.totalIncTax, 0),
+      invoices: shaped.slice(0, 25)
+    };
   },
 
   async getJobPnl({ jobNumber }) {
-    // TODO: not yet wired to a confirmed Simpro endpoint.
-    throw new Error('getJobPnl not yet implemented — endpoint not confirmed');
+    const j = await simproRequest(`companies/${COMPANY_ID}/jobs/${jobNumber}`, {
+      columns: 'ID,Name,Stage,Status,Customer,Total,Totals,DateIssued'
+    });
+
+    const exTax = j.Total?.ExTax ?? 0;
+    const gp = j.Totals?.GrossProfitLoss?.Actual ?? 0;
+    const margin = j.Totals?.GrossMargin?.Actual ?? (exTax > 0 ? Math.round((gp / exTax) * 10000) / 100 : 0);
+    const matActual = j.Totals?.MaterialsCost?.Actual ?? 0;
+    const matCommitted = j.Totals?.MaterialsCost?.Committed ?? 0;
+    const labourActual = j.Totals?.ResourcesCost?.Labor?.Actual ?? 0;
+    const totalCostsActual = (j.Totals?.ResourcesCost?.Total?.Actual ?? 0) + matActual;
+    const costPct = exTax > 0 ? Math.round((totalCostsActual / exTax) * 100) : 0;
+
+    return {
+      jobId: String(j.ID),
+      customer: j.Customer?.CompanyName
+        || `${j.Customer?.GivenName ?? ''} ${j.Customer?.FamilyName ?? ''}`.trim()
+        || 'Unknown',
+      stage: j.Stage ?? '',
+      statusName: j.Status?.Name ?? '',
+      dateIssued: j.DateIssued ?? '',
+      contractExTax: exTax,
+      contractIncTax: j.Total?.IncTax ?? 0,
+      grossProfitActual: gp,
+      grossMarginPct: margin,
+      materialsCostActual: matActual,
+      materialsCostCommitted: matCommitted,
+      labourCostActual: labourActual,
+      totalCostsActual,
+      costPctOfSell: `${costPct}% of sell price`,
+      health: pnlHealth(margin)
+    };
   },
 
   async getJobPurchaseOrders({ jobNumber, dateFrom, dateTo }) {
-    // TODO: not yet wired to a confirmed Simpro endpoint — check Retool's
-    // getPurchaseOrders query for the real path.
-    throw new Error('getJobPurchaseOrders not yet implemented — endpoint not confirmed');
+    let orders = await fetchAllVendorOrders();
+
+    if (jobNumber) orders = orders.filter((po) => String(po.AssignedTo?.Job) === String(jobNumber));
+    if (dateFrom) orders = orders.filter((po) => (po.DateIssued ?? '') >= dateFrom);
+    if (dateTo) orders = orders.filter((po) => (po.DateIssued ?? '') <= dateTo);
+
+    const shaped = orders.map((po) => ({
+      poId: po.ID,
+      jobId: po.AssignedTo?.Job ?? null,
+      stage: po.Stage,
+      reference: po.Reference,
+      totalExTax: po.Totals?.ExTax ?? 0,
+      totalIncTax: po.Totals?.IncTax ?? 0,
+      dateIssued: po.DateIssued ?? ''
+    }));
+
+    const totalPoValue = shaped.reduce((s, p) => s + p.totalIncTax, 0);
+
+    let jobContractValue = null;
+    let poPctOfJobValue = null;
+    if (jobNumber) {
+      try {
+        const job = await simproRequest(`companies/${COMPANY_ID}/jobs/${jobNumber}`, { columns: 'ID,Total' });
+        jobContractValue = job.Total?.IncTax ?? null;
+        if (jobContractValue) poPctOfJobValue = Math.round((totalPoValue / jobContractValue) * 1000) / 10;
+      } catch (e) {
+        // Job lookup failed — leave the comparison out rather than guessing.
+      }
+    }
+
+    return {
+      count: shaped.length,
+      totalPoValue,
+      jobContractValue,
+      poPctOfJobValue,
+      orders: shaped.slice(0, 25)
+    };
   }
 };
 
