@@ -518,7 +518,7 @@ async function runAgent(userMessage, conversationHistory = []) {
   while (true) {
     const response = await anthropic.messages.create({
       model: MODEL,
-      max_tokens: 1024,
+      max_tokens: 4096,
       system: SYSTEM_PROMPT,
       tools: TOOLS,
       messages
